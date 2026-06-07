@@ -13,9 +13,18 @@ const TEXT_EXTS: &[&str] = &[
     "gradle", "groovy", "proto", "tf", "hcl",
 ];
 
+/// Image extensions. We can't read their contents, but we index them by
+/// filename so they're findable by name (and clickable to open).
+const IMAGE_EXTS: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "tif", "tiff", "ico", "heic", "heif", "avif",
+];
+
 /// Returns true if this path's extension is something we can index.
 pub fn is_supported(path: &Path) -> bool {
-    matches!(kind(path), FileKind::Text | FileKind::Pdf | FileKind::Docx | FileKind::Pptx | FileKind::Xlsx)
+    matches!(
+        kind(path),
+        FileKind::Text | FileKind::Pdf | FileKind::Docx | FileKind::Pptx | FileKind::Xlsx | FileKind::Image
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -25,6 +34,8 @@ pub enum FileKind {
     Docx,
     Pptx,
     Xlsx,
+    /// Indexed by filename only (no content extraction).
+    Image,
     Unsupported,
 }
 
@@ -39,6 +50,7 @@ pub fn kind(path: &Path) -> FileKind {
         "docx" => FileKind::Docx,
         "pptx" => FileKind::Pptx,
         "xlsx" | "xlsm" => FileKind::Xlsx,
+        _ if IMAGE_EXTS.contains(&ext.as_str()) => FileKind::Image,
         _ if TEXT_EXTS.contains(&ext.as_str()) => FileKind::Text,
         // Files named exactly like these (no extension) are still useful.
         _ => {
@@ -66,6 +78,11 @@ pub fn extract(path: &Path) -> Result<Option<String>, String> {
         FileKind::Docx => extract_ooxml(path, &["word/document.xml"])?,
         FileKind::Pptx => extract_pptx(path)?,
         FileKind::Xlsx => extract_xlsx(path)?,
+        // No content to read — index the filename so it's searchable by name.
+        FileKind::Image => {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            format!("图片 {name}")
+        }
         FileKind::Unsupported => return Ok(None),
     };
     let trimmed = text.trim();

@@ -287,7 +287,7 @@ export default function App() {
 
         <div className="border-t p-2" style={{ borderColor: "var(--border)" }}>
           <button
-            onClick={() => setView("settings")}
+            onClick={() => setView((v) => (v === "settings" ? "chat" : "settings"))}
             className="hoverable flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm"
             style={view === "settings" ? { color: "var(--accent)" } : undefined}
           >

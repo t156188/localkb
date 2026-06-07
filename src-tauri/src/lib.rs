@@ -23,7 +23,10 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let base = app.path().app_data_dir()?;
+            // Use the system data root (no bundle-id segment) so data lives at
+            // ~/Library/Application Support/LOCALKB on macOS and %APPDATA%\LOCALKB
+            // on Windows, rather than under com.localkb.app/.
+            let base = app.path().data_dir()?;
             let data_dir = base.join("LOCALKB");
             std::fs::create_dir_all(&data_dir)?;
             let db_path = data_dir.join("index.db");

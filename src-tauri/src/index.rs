@@ -89,10 +89,10 @@ pub fn reindex(
     emit(IndexEvent::Start { total: work.len() });
 
     // Make sure the embedder is loaded (best effort — FTS still works without
-    // it). On first run this downloads ~100MB, so announce it; otherwise the
-    // app sits silent for minutes and reads as a hang.
+    // it). On first run this downloads the model, which is slow; announce it so
+    // the silent stretch doesn't read as a hang.
     emit(IndexEvent::Status {
-        phase: "正在准备向量模型…（首次需下载，约 100MB）".into(),
+        phase: "正在建立索引…（首次较慢，请稍候）".into(),
     });
     ensure_embedder(embedder, models_dir);
 
