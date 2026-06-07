@@ -1,0 +1,38 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+**/.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Tauri / Rust (兜底，主规则在 src-tauri/.gitignore)
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# 脚本生成的测试数据（含图片/二进制，不需要进库）
+/test-kb/
+
+# 图标生成产物（由 icon-src/*.mjs 从 icon.svg 重新生成）
+icon-src/*.png
+
+# CI 按平台下载的 PDFium（Windows dll 不进库；mac arm64 dylib 仍保留供本地开发）
+src-tauri/pdfium/pdfium.dll

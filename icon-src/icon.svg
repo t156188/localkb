@@ -1,0 +1,35 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7c6cff"/>
+      <stop offset="0.55" stop-color="#4f46e5"/>
+      <stop offset="1" stop-color="#3b1d8f"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.30" r="0.78">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.20"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="sh" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#170d38" flood-opacity="0.40"/>
+    </filter>
+  </defs>
+
+  <rect width="1024" height="1024" rx="232" fill="url(#bg)"/>
+  <rect width="1024" height="1024" rx="232" fill="url(#glow)"/>
+
+  <g filter="url(#sh)">
+    <g stroke="#ffffff" stroke-width="20" stroke-opacity="0.8" stroke-linecap="round">
+      <line x1="512" y1="500" x2="358" y2="350"/>
+      <line x1="512" y1="500" x2="676" y2="332"/>
+      <line x1="512" y1="500" x2="700" y2="612"/>
+      <line x1="512" y1="500" x2="372" y2="664"/>
+      <line x1="358" y1="350" x2="676" y2="332"/>
+    </g>
+    <circle cx="358" cy="350" r="46" fill="#ffffff"/>
+    <circle cx="676" cy="332" r="38" fill="#ffffff"/>
+    <circle cx="700" cy="612" r="42" fill="#ffffff"/>
+    <circle cx="372" cy="664" r="38" fill="#ffffff"/>
+    <circle cx="512" cy="500" r="70" fill="#ffffff"/>
+    <circle cx="512" cy="500" r="34" fill="#4f46e5"/>
+  </g>
+</svg>

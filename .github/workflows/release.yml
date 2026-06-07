@@ -1,0 +1,99 @@
+name: Release
+
+# 推一个 v* 标签即触发整条打包流程（mac arm64 + mac intel + windows）。
+# 也可在 Actions 里手动触发，指定一个已存在的标签重新出包。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to (re)release, e.g. v0.1.0'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest      # Apple Silicon (M1/M2/M3/M4)
+            label: macOS arm64
+            args: '--target aarch64-apple-darwin'
+            rust_target: aarch64-apple-darwin
+          - platform: macos-latest      # Intel Macs
+            label: macOS intel
+            args: '--target x86_64-apple-darwin'
+            rust_target: x86_64-apple-darwin
+          - platform: windows-latest    # Windows x64
+            label: Windows x64
+            args: ''
+            rust_target: ''
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.rust_target }}
+
+      - name: Install front-end deps
+        run: npm ci
+
+      # 按本 matrix 的目标平台/架构下载匹配的 PDFium 二进制，放到 src-tauri/pdfium/。
+      # tauri.macos/windows.conf.json 会把它打进各自的安装包，PDF 解析才能在三端都正常。
+      - name: Fetch PDFium for ${{ matrix.label }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.rust_target }}" in
+            aarch64-apple-darwin) PKG=pdfium-mac-arm64 ;;
+            x86_64-apple-darwin)  PKG=pdfium-mac-x64 ;;
+            *)                    PKG=pdfium-win-x64 ;;
+          esac
+          URL="https://github.com/bblanchon/pdfium-binaries/releases/latest/download/${PKG}.tgz"
+          echo "Downloading $URL"
+          curl -fL -o pdfium.tgz "$URL"
+          mkdir -p pdfium-extract src-tauri/pdfium
+          tar -xzf pdfium.tgz -C pdfium-extract
+          if [ "$PKG" = "pdfium-win-x64" ]; then
+            cp pdfium-extract/bin/pdfium.dll src-tauri/pdfium/pdfium.dll
+          else
+            cp pdfium-extract/lib/libpdfium.dylib src-tauri/pdfium/libpdfium.dylib
+          fi
+
+      # tauri-action 跑 beforeBuildCommand(npm run build) 编译前端，再 cargo tauri build，
+      # 并把产物上传到以该标签命名的 draft release（三个 job 共用同一个 release）。
+      - name: Build & release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # ↓ macOS 签名 + 公证。复用 MDGEM 相同的 secret 名字，证书/凭据可直接共用。
+          APPLE_CERTIFICATE: ${{ secrets.MACOS_CERT_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: '知索 __VERSION__'
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
