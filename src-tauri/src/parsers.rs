@@ -144,6 +144,7 @@ fn load_pdfium() -> Result<pdfium_render::prelude::Pdfium, String> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(d) = exe.parent() {
             dirs.push(d.to_path_buf()); // next to binary (dev + win bundle)
+            dirs.push(d.join("../Frameworks")); // macOS .app bundle (signed framework)
             dirs.push(d.join("../Resources")); // macOS .app bundle
             dirs.push(d.join("../lib"));
         }

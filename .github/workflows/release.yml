@@ -32,7 +32,7 @@ jobs:
             rust_target: x86_64-apple-darwin
           - platform: windows-latest    # Windows x64
             label: Windows x64
-            args: ''
+            args: '--bundles nsis'      # 只出 NSIS 安装包，跳过会挂的 WiX/MSI
             rust_target: ''
 
     steps:
