@@ -124,3 +124,32 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+  # GitHub 上传 release 附件时会删掉非 ASCII 字符，所以中文产品名「知索」会被砍掉，
+  # 文件名变成 _0.1.1_aarch64.dmg。这里在三平台都构建完后，给这些被砍掉前缀的
+  # 文件统一补上 ASCII 名「Zhisuo」。App 本身仍叫「知索」，只动下载文件名。
+  rename-assets:
+    name: Rename assets (ASCII)
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Prefix Zhisuo to stripped asset names
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          REL=$(gh api "repos/$REPO/releases" --jq ".[] | select(.tag_name==\"$TAG\") | .id")
+          echo "release id: $REL"
+          gh api "repos/$REPO/releases/$REL/assets" --jq '.[] | "\(.id) \(.name)"' \
+          | while read -r id name; do
+              case "$name" in
+                _*) new="Zhisuo$name"
+                    echo "rename $name -> $new"
+                    gh api -X PATCH "repos/$REPO/releases/assets/$id" -f name="$new" >/dev/null ;;
+                *)  echo "skip $name" ;;
+              esac
+            done
