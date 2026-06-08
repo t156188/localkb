@@ -1,6 +1,6 @@
 [package]
 name = "localkb"
-version = "0.1.0"
+version = "0.1.1"
 description = "LOCALKB — 本地知识检索"
 authors = ["you"]
 edition = "2021"

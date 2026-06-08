@@ -52,6 +52,20 @@ jobs:
           workspaces: src-tauri
           key: ${{ matrix.rust_target }}
 
+      # 把版本号同步成本次标签（v1.2.3 -> 1.2.3），写进 package.json / tauri.conf.json /
+      # Cargo.toml / Cargo.lock。这样以后只要打新标签，产物版本号就自动跟上，无需手改源码。
+      - name: Sync version to tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VER="${TAG#v}"
+          echo "Setting version to $VER (from tag $TAG)"
+          node -e "const fs=require('fs');const p='package.json';const c=JSON.parse(fs.readFileSync(p));c.version=process.argv[1];fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n')" "$VER"
+          node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const c=JSON.parse(fs.readFileSync(p));c.version=process.argv[1];fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n')" "$VER"
+          node -e "const fs=require('fs');const p='src-tauri/Cargo.toml';let s=fs.readFileSync(p,'utf8');s=s.replace(/^version = \"[^\"]*\"/m,'version = \"'+process.argv[1]+'\"');fs.writeFileSync(p,s)" "$VER"
+          node -e "const fs=require('fs');const p='src-tauri/Cargo.lock';let s=fs.readFileSync(p,'utf8');s=s.replace(/(name = \"localkb\"\nversion = )\"[^\"]*\"/,'$1\"'+process.argv[1]+'\"');fs.writeFileSync(p,s)" "$VER"
+
       - name: Install front-end deps
         run: npm ci
 
