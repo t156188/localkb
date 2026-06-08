@@ -36,3 +36,6 @@ icon-src/*.png
 
 # CI 按平台下载的 PDFium（Windows dll 不进库；mac arm64 dylib 仍保留供本地开发）
 src-tauri/pdfium/pdfium.dll
+
+# 本地存放的发布安装包（dmg/exe），从 GitHub Release 下载回来，不进库
+/release/
