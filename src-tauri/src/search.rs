@@ -143,6 +143,183 @@ fn build_fts_match(query: &str) -> Option<String> {
     Some(quoted.join(" OR "))
 }
 
+/// Count indexed files whose **path** contains `keyword` (case-insensitive) —
+/// matching the file name *or any parent folder*, so a folder named after the
+/// subject (e.g. `壁纸/`, `banner/`) is counted as that subject. An empty
+/// keyword matches everything, useful for "how many images do I have" combined
+/// with the extension filter. Unlike [`hybrid`], this is an exact aggregate
+/// over the whole corpus — the right tool for "how many X" / "list all X"
+/// questions, which top-K retrieval can't answer (it would only ever see
+/// `top_n` matches).
+///
+/// Returns the total match count plus up to `limit` representative rows
+/// `(chunk_id, file_name, full_path)` for listing and clickable sources.
+pub fn count_by_name(
+    conn: &Connection,
+    keyword: &str,
+    exts: &[&str],
+    limit: usize,
+) -> Result<(usize, Vec<(i64, String, String)>), String> {
+    // One representative chunk per file (the first), so each match can be shown
+    // as a clickable source.
+    let mut stmt = conn
+        .prepare(
+            "SELECT f.path, (SELECT MIN(c.id) FROM chunks c WHERE c.file_id = f.id) \
+             FROM files f ORDER BY f.path",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            let path: String = r.get(0)?;
+            let cid: Option<i64> = r.get(1)?;
+            Ok((path, cid))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let kw = keyword.trim().to_lowercase();
+    let mut total = 0usize;
+    let mut listed: Vec<(i64, String, String)> = Vec::new();
+    for row in rows {
+        let (path, cid) = row.map_err(|e| e.to_string())?;
+        let p = std::path::Path::new(&path);
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&path)
+            .to_string();
+        // Match the keyword anywhere in the path (file name or folder names).
+        if !kw.is_empty() && !path.to_lowercase().contains(&kw) {
+            continue;
+        }
+        // Optional media-kind filter by extension.
+        if !exts.is_empty() {
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .unwrap_or_default();
+            if !exts.iter().any(|e| *e == ext) {
+                continue;
+            }
+        }
+        total += 1;
+        if listed.len() < limit {
+            if let Some(cid) = cid {
+                listed.push((cid, name, path));
+            }
+        }
+    }
+    Ok((total, listed))
+}
+
+/// Per-folder file tally — the real inventory the model reasons over when
+/// answering "how many X" for any phrasing/naming convention.
+#[derive(Clone)]
+pub struct FolderStat {
+    pub name: String,
+    pub images: usize,
+    pub videos: usize,
+    pub files: usize,
+}
+
+/// Build the knowledge base's folder inventory: for each immediate-parent
+/// folder, how many images / videos / files it holds. Returns the folders
+/// sorted by media count (capped at `limit`) plus library-wide totals
+/// `(images, videos, files)`. This is the grounding context for count
+/// questions — exact numbers the model phrases but never invents.
+pub fn folder_inventory(
+    conn: &Connection,
+    img_exts: &[&str],
+    vid_exts: &[&str],
+    limit: usize,
+) -> Result<(Vec<FolderStat>, usize, usize, usize), String> {
+    use std::collections::HashMap;
+    let mut stmt = conn
+        .prepare("SELECT path FROM files")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+
+    let mut map: HashMap<String, FolderStat> = HashMap::new();
+    let (mut ti, mut tv, mut tf) = (0usize, 0usize, 0usize);
+    for row in rows {
+        let path = row.map_err(|e| e.to_string())?;
+        let p = std::path::Path::new(&path);
+        let parent = p
+            .parent()
+            .and_then(|x| x.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
+        let is_img = img_exts.iter().any(|e| *e == ext);
+        let is_vid = vid_exts.iter().any(|e| *e == ext);
+        tf += 1;
+        if is_img {
+            ti += 1;
+        }
+        if is_vid {
+            tv += 1;
+        }
+        let st = map.entry(parent.clone()).or_insert(FolderStat {
+            name: parent,
+            images: 0,
+            videos: 0,
+            files: 0,
+        });
+        st.files += 1;
+        if is_img {
+            st.images += 1;
+        }
+        if is_vid {
+            st.videos += 1;
+        }
+    }
+    let mut v: Vec<FolderStat> = map.into_values().collect();
+    v.sort_by(|a, b| {
+        (b.images + b.videos)
+            .cmp(&(a.images + a.videos))
+            .then(b.files.cmp(&a.files))
+    });
+    v.truncate(limit);
+    Ok((v, ti, tv, tf))
+}
+
+/// Distinct immediate-parent folder names across indexed files (deduped, capped
+/// at `limit`). Gives the router a sense of how the user organizes things, so it
+/// can map a concept ("壁纸") onto an actual folder ("banner").
+pub fn folder_names(conn: &Connection, limit: usize) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT path FROM files")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?;
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for row in rows {
+        let path = row.map_err(|e| e.to_string())?;
+        if let Some(name) = std::path::Path::new(&path)
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+        {
+            if seen.insert(name.to_string()) {
+                out.push(name.to_string());
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Look up full source detail for an ordered list of chunk ids.
 pub fn sources_for(conn: &Connection, chunk_ids: &[i64]) -> Result<Vec<Source>, String> {
     let mut out = Vec::new();

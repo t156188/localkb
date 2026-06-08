@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import {
   FolderPlus,
   RefreshCw,
@@ -71,6 +72,7 @@ export function SettingsView({
   const [saved, setSaved] = useState(false);
   const [savedIdx, setSavedIdx] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [version, setVersion] = useState("");
   // Show the add form by default only until the first provider exists.
   const [showAdd, setShowAdd] = useState(providers.length === 0);
 
@@ -81,6 +83,11 @@ export function SettingsView({
       setCpu(info);
       setIndexThreads((cur) => (cur > 0 ? cur : info.recommended));
     });
+  }, []);
+
+  // App version, read from the bundle (kept in sync with tauri.conf.json).
+  useEffect(() => {
+    getVersion().then(setVersion).catch(() => {});
   }, []);
 
   const card = {
@@ -421,6 +428,11 @@ export function SettingsView({
             ))}
           </div>
         </section>
+
+        {/* Version -------------------------------------------------------- */}
+        <p className="mt-6 text-center text-xs" style={{ color: "var(--muted)" }}>
+          知索{version ? ` v${version}` : ""}
+        </p>
       </div>
     </div>
   );

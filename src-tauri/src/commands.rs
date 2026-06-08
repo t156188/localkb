@@ -2,7 +2,7 @@ use crate::index;
 use crate::indexer;
 use crate::search::{self, Source};
 use crate::state::AppState;
-use crate::{chat, history, settings};
+use crate::{chat, history, parsers, settings};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -194,10 +194,29 @@ fn run_ask(
         return Err("尚未配置模型 API Key，请在设置中填写。".into());
     }
 
-    // 1. Route: decide chat vs. search, and rewrite follow-ups into a
+    // 1. Route: decide chat / count / search, and rewrite follow-ups into a
     //    self-contained query. Falls back to "search with the raw question".
     let _ = on_event.send(AskEvent::Status { stage: "正在分析问题…".into() });
-    let (needs_search, query) = route_query(&provider, history, question);
+    // Folder names give the router a map of how the user organizes files, so a
+    // concept like "壁纸" can resolve onto a real directory (e.g. "banner").
+    let folders = {
+        let conn = st.db.lock().unwrap();
+        search::folder_names(&conn, 80).unwrap_or_default()
+    };
+    let route = route_query(&provider, history, question, &folders);
+
+    // 1b. Count / list intent ("X有多少照片", "列出所有…"): answer from an exact
+    //     DB aggregate rather than top-K retrieval, which can only ever see
+    //     `top_n` matches and so can't actually count.
+    if let Route::Count { keyword, kind } = &route {
+        return run_count(st, &provider, on_event, question, keyword, *kind);
+    }
+
+    let needs_search = matches!(route, Route::Search(_));
+    let query = match &route {
+        Route::Search(q) => q.clone(),
+        _ => String::new(),
+    };
 
     // 2. Retrieve only when the router asked for it.
     let (sources, context) = if needs_search {
@@ -244,11 +263,150 @@ fn run_ask(
     Ok(())
 }
 
-/// Ask the model whether the latest message needs the knowledge base, and to
-/// rewrite it into a standalone search query. Returns (needs_search, query).
-/// Any failure degrades to (true, raw question) — i.e. the previous behaviour.
-fn route_query(provider: &chat::Provider, history: &[ChatMsg], question: &str) -> (bool, String) {
-    const ROUTER_SYSTEM: &str = "你是一个对话路由器。判断用户的【最新消息】是否需要检索本地知识库（用户的本地文档）才能准确回答。\n- 问候、闲聊、关于助手自身、与文档无关的通用常识 → mode = chat\n- 需要查阅用户文档/资料才能回答 → mode = search，并结合对话历史把最新消息改写成一句不含指代（你/它/这个等）、可直接用于全文检索的查询。\n只输出 JSON，不要任何解释或代码块：{\"mode\":\"chat\"或\"search\",\"query\":\"检索查询\"}";
+/// Which media a count/list question is about, used to filter by extension.
+#[derive(Clone, Copy)]
+enum MediaKind {
+    Image,
+    Video,
+    Any,
+}
+
+impl MediaKind {
+    fn parse(s: &str) -> Self {
+        match s {
+            "image" => MediaKind::Image,
+            "video" => MediaKind::Video,
+            _ => MediaKind::Any,
+        }
+    }
+    /// Extensions to restrict the count to ("" = no restriction).
+    fn exts(self) -> &'static [&'static str] {
+        match self {
+            MediaKind::Image => parsers::IMAGE_EXTS,
+            MediaKind::Video => parsers::VIDEO_EXTS,
+            MediaKind::Any => &[],
+        }
+    }
+    /// Noun for phrasing the answer.
+    fn label(self) -> &'static str {
+        match self {
+            MediaKind::Image => "图片",
+            MediaKind::Video => "视频",
+            MediaKind::Any => "文件",
+        }
+    }
+}
+
+/// The router's decision for the latest message.
+enum Route {
+    /// Casual chat — no retrieval.
+    Chat,
+    /// Knowledge question — retrieve `top_n` chunks for this (rewritten) query.
+    Search(String),
+    /// "How many / list all" — answer from an exact DB aggregate.
+    Count { keyword: String, kind: MediaKind },
+}
+
+/// Answer any "how many / list" question by grounding the model in the
+/// knowledge base's *real* inventory: the per-folder file/image/video tallies
+/// plus library-wide totals, and — when the question is about a specific
+/// name/subject — an exact filename match count. Every number is computed in
+/// code; the model only selects the relevant ones and phrases them. This
+/// generalizes across everyone's folder-naming habits without any hardcoded
+/// synonym table.
+fn run_count(
+    st: &AppState,
+    provider: &chat::Provider,
+    on_event: &Channel<AskEvent>,
+    question: &str,
+    keyword: &str,
+    kind: MediaKind,
+) -> Result<(), String> {
+    // A few sample files are enough to convey naming; a folder of thousands
+    // shouldn't dump them all. The counts themselves stay exact.
+    const SAMPLE: usize = 8;
+
+    let _ = on_event.send(AskEvent::Status { stage: "正在统计…".into() });
+    let (inventory, total_images, total_videos, total_files, kw_total, kw_samples) = {
+        let conn = st.db.lock().unwrap();
+        let (inv, ti, tv, tf) =
+            search::folder_inventory(&conn, parsers::IMAGE_EXTS, parsers::VIDEO_EXTS, 60)?;
+        // A keyword count only makes sense for a specific subject; for a bare
+        // "how many images" the keyword is empty and we lean on the inventory.
+        let (kt, ks) = if keyword.is_empty() {
+            (0, Vec::new())
+        } else {
+            search::count_by_name(&conn, keyword, kind.exts(), SAMPLE)?
+        };
+        (inv, ti, tv, tf, kt, ks)
+    };
+
+    // Clickable sources: the matched sample files for a subject question.
+    let sources: Vec<Source> = kw_samples
+        .iter()
+        .enumerate()
+        .map(|(i, (cid, name, path))| Source {
+            index: i + 1,
+            chunk_id: *cid,
+            path: path.clone(),
+            name: name.clone(),
+            heading: String::new(),
+            snippet: String::new(),
+        })
+        .collect();
+    let _ = on_event.send(AskEvent::Sources { sources });
+
+    // Ground the model in real numbers it must not alter or invent.
+    let mut facts = String::from("【知识库各文件夹的真实数量（按媒体数排序）】\n");
+    for f in &inventory {
+        facts.push_str(&format!(
+            "- {}：图片 {} 张，视频 {} 个，文件共 {} 个\n",
+            f.name, f.images, f.videos, f.files
+        ));
+    }
+    facts.push_str(&format!(
+        "\n【全库合计】图片 {total_images} 张，视频 {total_videos} 个，文件总数 {total_files} 个\n"
+    ));
+    if !keyword.is_empty() {
+        facts.push_str(&format!(
+            "\n【按文件名匹配「{}」的{}】共 {} 个",
+            keyword,
+            kind.label(),
+            kw_total
+        ));
+        if !kw_samples.is_empty() {
+            let names: Vec<&str> = kw_samples.iter().map(|(_, n, _)| n.as_str()).collect();
+            facts.push_str(&format!("（示例：{}）", names.join("、")));
+        }
+        facts.push('\n');
+    }
+
+    let _ = on_event.send(AskEvent::Status { stage: "正在生成回答…".into() });
+    let system = "你是「知索」本地知识库助手。下面给你的是知识库的【真实统计数据】，所有数字都是准确的——必须直接引用，绝对不要自己累加估算、改动或编造任何数字或文件夹名。请用自然、口语化、简洁的中文回答用户的问题：\n- 用户问某一类内容有多少（如壁纸、头像、海报、某主题图片）：从文件夹清单里找【名称或含义最贴切的真实文件夹】来回答；如果有多个明显相关的文件夹，可以分别说明或把它们已给出的数字相加。\n- 用户问某类文件的全库总数（如「我有多少图片/视频」）：用【全库合计】里的数字。\n- 用户问某个具体名字/主题（如某个人名）：用【按文件名匹配】的结果。\n- 如果清单里没有贴切的文件夹，就如实说没有，并可推荐清单里相近的文件夹供参考，不要硬凑。\n- 不要罗列大量文件名，最多举两三个例子；使用简洁 Markdown。";
+    let user = format!("{facts}\n用户的问题：{question}\n\n请据此自然、准确地回答。");
+    let messages = json!([
+        { "role": "system", "content": system },
+        { "role": "user", "content": user },
+    ]);
+    let answer = chat::stream_completion(provider, messages, |piece| {
+        let _ = on_event.send(AskEvent::Delta {
+            text: piece.to_string(),
+        });
+    })?;
+    let _ = on_event.send(AskEvent::Done { answer });
+    Ok(())
+}
+
+/// Ask the model to classify the latest message and, for searches, rewrite it
+/// into a standalone query. Any failure degrades to `Search(raw question)` —
+/// i.e. the previous behaviour.
+fn route_query(
+    provider: &chat::Provider,
+    history: &[ChatMsg],
+    question: &str,
+    folders: &[String],
+) -> Route {
+    const ROUTER_SYSTEM: &str = "你是一个对话路由器。判断用户【最新消息】的意图并输出 JSON：\n- mode=chat：问候、闲聊、关于助手自身、与文档无关的通用常识。\n- mode=count：用户想知道某类文件/照片/图片/视频的【数量】，或要求【列出/列举全部】符合条件的文件（如「X有多少张照片」「列出所有关于Y的文件」「有几个视频」「我有多少图片」）。请给出 keyword 和 kind：\n  · keyword：用户问的核心主题词。如果是某个具体名字/主题（如人名）就用该词本身，【保持用户的原文语言，绝不翻译成英文或其他词】。如果下方【已知文件夹】里恰好有名称与之高度吻合的，可改用那个真实文件夹名。若用户只是泛指某类文件总数（如「我有多少图片」「一共多少视频」），keyword 留空。\n  · kind：照片/图片/壁纸/头像等图像→image，视频→video，其他或泛指文件→file。\n- mode=search：其余需要查阅文档内容才能回答的问题；结合对话历史把最新消息改写成一句不含指代（你/它/这个等）、可直接用于全文检索的 query。\n只输出 JSON，不要任何解释或代码块：{\"mode\":\"chat|count|search\",\"query\":\"\",\"keyword\":\"\",\"kind\":\"image|video|file\"}";
 
     // Recent turns give the router the context to resolve pronouns.
     let mut hist = String::new();
@@ -257,8 +415,16 @@ fn route_query(provider: &chat::Provider, history: &[ChatMsg], question: &str) -
         let who = if m.role == "assistant" { "助手" } else { "用户" };
         hist.push_str(&format!("{who}: {}\n", m.content));
     }
+    // Known folder names let the router map a concept ("壁纸") onto a real
+    // directory ("banner") when extracting the count keyword.
+    let folder_hint = if folders.is_empty() {
+        "(无)".to_string()
+    } else {
+        folders.join("、")
+    };
     let user = format!(
-        "对话历史:\n{}\n用户最新消息: {}\n\n请输出路由 JSON。",
+        "已知文件夹: {}\n\n对话历史:\n{}\n用户最新消息: {}\n\n请输出路由 JSON。",
+        folder_hint,
         if hist.is_empty() { "(无)\n" } else { &hist },
         question
     );
@@ -270,27 +436,40 @@ fn route_query(provider: &chat::Provider, history: &[ChatMsg], question: &str) -
 
     let raw = match chat::complete(provider, messages, 0.0, 200) {
         Ok(s) => s,
-        Err(_) => return (true, question.to_string()),
+        Err(_) => return Route::Search(question.to_string()),
     };
     parse_route(&raw, question)
 }
 
-fn parse_route(raw: &str, fallback_q: &str) -> (bool, String) {
+fn parse_route(raw: &str, fallback_q: &str) -> Route {
     if let (Some(s), Some(e)) = (raw.find('{'), raw.rfind('}')) {
         if e > s {
             if let Ok(v) = serde_json::from_str::<Value>(&raw[s..=e]) {
-                let needs_search = v["mode"].as_str().unwrap_or("search") != "chat";
+                match v["mode"].as_str().unwrap_or("search") {
+                    "chat" => return Route::Chat,
+                    "count" => {
+                        let keyword = v["keyword"].as_str().unwrap_or("").trim().to_string();
+                        let kind = MediaKind::parse(v["kind"].as_str().unwrap_or("file"));
+                        // Count needs *something* to scope on: a keyword, or a
+                        // specific media kind (e.g. "how many images total").
+                        // Otherwise fall back to a normal search.
+                        if !keyword.is_empty() || !matches!(kind, MediaKind::Any) {
+                            return Route::Count { keyword, kind };
+                        }
+                    }
+                    _ => {}
+                }
                 let query = v["query"]
                     .as_str()
                     .map(|q| q.trim())
                     .filter(|q| !q.is_empty())
                     .unwrap_or(fallback_q)
                     .to_string();
-                return (needs_search, query);
+                return Route::Search(query);
             }
         }
     }
-    (true, fallback_q.to_string())
+    Route::Search(fallback_q.to_string())
 }
 
 /// Collect the citation numbers `[n]` that appear in the answer text.

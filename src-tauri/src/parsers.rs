@@ -15,12 +15,12 @@ const TEXT_EXTS: &[&str] = &[
 
 /// Image extensions. We can't read their contents, but we index them by
 /// filename so they're findable by name (and clickable to open).
-const IMAGE_EXTS: &[&str] = &[
+pub const IMAGE_EXTS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "tif", "tiff", "ico", "heic", "heif", "avif",
 ];
 
 /// Video extensions. Indexed by filename only (no content extraction).
-const VIDEO_EXTS: &[&str] = &[
+pub const VIDEO_EXTS: &[&str] = &[
     "mp4", "mov", "avi", "mkv", "wmv", "flv", "webm", "m4v", "mpeg", "mpg", "3gp", "ts", "m2ts",
     "rmvb", "rm", "vob", "ogv", "f4v",
 ];
