@@ -91,6 +91,7 @@ pub fn run() {
             commands::get_settings,
             commands::set_settings,
             commands::list_models,
+            commands::cpu_info,
             commands::history_list,
             commands::history_read,
             commands::history_write,

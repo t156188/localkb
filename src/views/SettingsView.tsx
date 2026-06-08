@@ -12,7 +12,7 @@ import {
   Eye,
   EyeOff,
 } from "lucide-react";
-import { FolderInfo, ProviderCfg, Settings, listModels } from "../lib/api";
+import { CpuInfo, FolderInfo, ProviderCfg, Settings, cpuInfo, listModels } from "../lib/api";
 
 export interface IndexingState {
   active: boolean;
@@ -64,10 +64,24 @@ export function SettingsView({
 }: Props) {
   const { providers, activeProviderId } = settings;
   const [topN, setTopN] = useState(settings.topN);
+  const [cpu, setCpu] = useState<CpuInfo | null>(null);
+  // Effective parsing concurrency; falls back to the machine recommendation
+  // once cpuInfo resolves and the user hasn't picked a value yet.
+  const [indexThreads, setIndexThreads] = useState(settings.indexThreads ?? 0);
   const [saved, setSaved] = useState(false);
+  const [savedIdx, setSavedIdx] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   // Show the add form by default only until the first provider exists.
   const [showAdd, setShowAdd] = useState(providers.length === 0);
+
+  // Detect cores once; if the user has never set a value, default the slider to
+  // the recommended concurrency for this machine.
+  useEffect(() => {
+    cpuInfo().then((info) => {
+      setCpu(info);
+      setIndexThreads((cur) => (cur > 0 ? cur : info.recommended));
+    });
+  }, []);
 
   const card = {
     background: "var(--panel)",
@@ -79,9 +93,13 @@ export function SettingsView({
     setTimeout(() => setSaved(false), 1500);
   };
 
+  // Persisted alongside every save so an unsaved slider edit isn't lost when
+  // some other setting changes. `> 0` guard: 0 means "not loaded yet".
+  const extra = () => (indexThreads > 0 ? { topN, indexThreads } : { topN });
+
   const addProvider = (vals: Omit<ProviderCfg, "id">) => {
     const entry: ProviderCfg = { ...vals, id: newId(), name: vals.name.trim() || vals.preset };
-    onSave({ ...settings, providers: [...providers, entry], activeProviderId, topN });
+    onSave({ ...settings, providers: [...providers, entry], activeProviderId, ...extra() });
     setShowAdd(false);
   };
 
@@ -91,7 +109,7 @@ export function SettingsView({
       providers: providers.map((p) =>
         p.id === id ? { ...vals, id, name: vals.name.trim() || vals.preset } : p,
       ),
-      topN,
+      ...extra(),
     });
     setEditingId(null);
   };
@@ -102,18 +120,24 @@ export function SettingsView({
       ...settings,
       providers: next,
       activeProviderId: id === activeProviderId ? "auto" : activeProviderId,
-      topN,
+      ...extra(),
     });
     setEditingId(null);
     if (next.length === 0) setShowAdd(true);
   };
 
   const saveTopN = () => {
-    onSave({ ...settings, topN });
+    onSave({ ...settings, ...extra() });
     flash();
   };
 
-  const setTheme = (theme: Settings["theme"]) => onSave({ ...settings, theme, topN });
+  const saveIndexThreads = () => {
+    onSave({ ...settings, ...extra() });
+    setSavedIdx(true);
+    setTimeout(() => setSavedIdx(false), 1500);
+  };
+
+  const setTheme = (theme: Settings["theme"]) => onSave({ ...settings, theme, ...extra() });
 
   return (
     <div className="h-full overflow-y-auto">
@@ -239,6 +263,38 @@ export function SettingsView({
                 className="absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all"
                 style={{ left: settings.autoSync ? "1.125rem" : "0.125rem" }}
               />
+            </button>
+          </div>
+
+          {/* Indexing concurrency */}
+          <div className="mt-3 border-t pt-3" style={{ borderColor: "var(--border)" }}>
+            <Field
+              label={`索引并发线程：${indexThreads || cpu?.recommended || "…"}${
+                cpu ? `（检测到 ${cpu.cores} 核，建议 ${cpu.recommended}）` : ""
+              }`}
+            >
+              <input
+                type="range"
+                min={1}
+                max={cpu?.cores ?? 16}
+                value={indexThreads || cpu?.recommended || 1}
+                onChange={(e) => setIndexThreads(Number(e.target.value))}
+                className="w-full"
+                disabled={!cpu}
+              />
+            </Field>
+            <p className="mt-1 text-xs" style={{ color: "var(--muted)" }}>
+              建索引时同时解析的文件数。调大更快、更占 CPU；调小更省、电脑更不卡。嵌入向量计算由
+              ONNX 自行多核处理，不受此项影响。
+            </p>
+            <button
+              onClick={saveIndexThreads}
+              className="mt-2 flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm disabled:opacity-40"
+              style={{ borderColor: "var(--border)" }}
+              disabled={!cpu}
+            >
+              {savedIdx ? <Check size={15} /> : null}
+              {savedIdx ? "已保存" : "保存索引设置"}
             </button>
           </div>
         </section>

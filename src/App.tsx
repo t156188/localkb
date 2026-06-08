@@ -22,6 +22,7 @@ import {
   onIndexEvent,
   ask,
   pickFolder,
+  confirmRemoveFolder,
 } from "./lib/api";
 import { ChatView } from "./views/ChatView";
 import { SettingsView, IndexingState } from "./views/SettingsView";
@@ -209,6 +210,9 @@ export default function App() {
   };
 
   const onRemoveFolder = async (id: number) => {
+    const folder = folders.find((f) => f.id === id);
+    const ok = await confirmRemoveFolder(folder?.path ?? "");
+    if (!ok) return;
     await removeFolder(id);
     refreshFolders();
   };

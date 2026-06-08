@@ -1,8 +1,11 @@
 use crate::embed::{self, Embedder};
-use crate::{chunk, db, parsers};
+use crate::{chunk, db, parsers, settings};
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -78,7 +81,10 @@ pub fn reindex(
             let p = entry.path();
             if p.is_file() && parsers::is_supported(p) {
                 if let Ok(meta) = p.metadata() {
-                    if meta.len() <= MAX_FILE_BYTES {
+                    // Name-only kinds (images/video/legacy office) aren't read
+                    // for content, so the size cap shouldn't exclude them —
+                    // videos in particular are routinely larger than the cap.
+                    if parsers::is_name_only(p) || meta.len() <= MAX_FILE_BYTES {
                         work.push((*fid, p.to_path_buf()));
                     }
                 }
@@ -96,30 +102,83 @@ pub fn reindex(
     });
     ensure_embedder(embedder, models_dir);
 
+    // folder id → root path, so each file's path context can be made relative.
+    let roots: HashMap<i64, PathBuf> =
+        folders.iter().map(|(id, p)| (*id, PathBuf::from(p))).collect();
+
+    // Preload (path → mtime, size) for the scanned folders so worker threads can
+    // cheaply skip unchanged files without each opening a DB connection.
+    let existing = load_existing(&conn, &folders);
+
+    // Every file we walked counts as "seen" (whether or not it gets rewritten),
+    // so the prune pass only drops files that truly vanished from disk.
+    let seen_paths: Vec<String> = work
+        .iter()
+        .map(|(_, p)| p.to_string_lossy().to_string())
+        .collect();
+
+    // Parse files in parallel, but keep a single writer. Parsing/extraction
+    // (PDF, office, …) is the serial bottleneck worth fanning out; embedding
+    // (ONNX) already uses multiple cores internally, and every DB write must go
+    // through one connection — so we parallelise only the parse stage.
+    let cfg = settings::load(&db_path.with_file_name("settings.json"));
+    let threads = settings::index_threads(&cfg).min(work.len()).max(1);
+
+    let work = Arc::new(work);
+    let roots = Arc::new(roots);
+    let existing = Arc::new(existing);
+    let cursor = Arc::new(AtomicUsize::new(0));
+
+    // Bounded so parsers can't race far ahead of the writer and balloon memory.
+    let (tx, rx) = sync_channel::<Outcome>(threads * 2);
+    let mut handles = Vec::with_capacity(threads);
+    for _ in 0..threads {
+        let tx = tx.clone();
+        let work = work.clone();
+        let roots = roots.clone();
+        let existing = existing.clone();
+        let cursor = cursor.clone();
+        handles.push(std::thread::spawn(move || loop {
+            let i = cursor.fetch_add(1, Ordering::Relaxed);
+            if i >= work.len() {
+                break;
+            }
+            let (fid, path) = &work[i];
+            let root = roots.get(fid).map(|p| p.as_path()).unwrap_or(path);
+            let outcome = prepare_one(&existing, *fid, path, root);
+            if tx.send(outcome).is_err() {
+                break; // writer gone
+            }
+        }));
+    }
+    drop(tx); // the writer loop ends once every worker has finished
+
+    let total = work.len();
     let mut indexed_files = 0usize;
     let mut total_chunks = 0usize;
-    let mut seen_paths: Vec<String> = Vec::new();
-
-    for (done, (fid, path)) in work.iter().enumerate() {
-        let path_str = path.to_string_lossy().to_string();
-        seen_paths.push(path_str.clone());
+    let mut done = 0usize;
+    // Single writer: receives prepared files in completion order and performs all
+    // DB writes + embeddings serially.
+    for outcome in rx {
         emit(IndexEvent::Progress {
             done,
-            total: work.len(),
-            file: path_str.clone(),
+            total,
+            file: outcome.path.clone(),
         });
-
-        match index_one(&conn, embedder, *fid, path) {
-            Ok(n) => {
-                if n > 0 {
+        done += 1;
+        if let Some(job) = outcome.job {
+            match write_prepared(&conn, embedder, job) {
+                Ok(n) if n > 0 => {
                     indexed_files += 1;
                     total_chunks += n;
                 }
-            }
-            Err(e) => {
-                eprintln!("index error {path_str}: {e}");
+                Ok(_) => {}
+                Err(e) => eprintln!("index write {}: {e}", outcome.path),
             }
         }
+    }
+    for h in handles {
+        let _ = h.join();
     }
 
     // Drop files that no longer exist on disk for the scanned folders.
@@ -148,15 +207,79 @@ pub fn ensure_embedder(embedder: &Arc<Mutex<Option<Embedder>>>, models_dir: &Pat
     }
 }
 
-/// Index a single file. Returns the number of chunks written (0 = skipped /
-/// unchanged / empty). Uses mtime+size to skip unchanged files cheaply.
-fn index_one(
-    conn: &Connection,
-    embedder: &Arc<Mutex<Option<Embedder>>>,
+/// Build the searchable path context for a file: "<root folder>/<relative
+/// path>", so the filename and every folder name on the way down are indexed
+/// (and findable) regardless of whether the content can be extracted.
+fn path_context(path: &Path, root: &Path) -> String {
+    match path.strip_prefix(root) {
+        Ok(rel) => {
+            let rel = rel.to_string_lossy();
+            match root.file_name().and_then(|n| n.to_str()) {
+                Some(name) if !name.is_empty() => format!("{name}/{rel}"),
+                _ => rel.into_owned(),
+            }
+        }
+        Err(_) => path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string(),
+    }
+}
+
+/// A file that's been parsed and is ready for the writer to persist.
+struct WriteJob {
+    folder_id: i64,
+    path: String,
+    mtime: i64,
+    size: i64,
+    hash: String,
+    chunks: Vec<chunk::Chunk>,
+}
+
+/// Result of the (parallel) parse stage for one file. `job` is `None` when the
+/// file is unchanged or yielded nothing to index; `path` is always set so the
+/// writer can report progress and prune correctly.
+struct Outcome {
+    path: String,
+    job: Option<WriteJob>,
+}
+
+/// Load (path → mtime, size) for the scanned folders, so the parse workers can
+/// skip unchanged files without each holding a DB connection.
+fn load_existing(conn: &Connection, folders: &[(i64, String)]) -> HashMap<String, (i64, i64)> {
+    let mut map = HashMap::new();
+    for (fid, _) in folders {
+        if let Ok(mut stmt) =
+            conn.prepare("SELECT path, mtime, size FROM files WHERE folder_id = ?1")
+        {
+            if let Ok(rows) = stmt.query_map(params![fid], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            }) {
+                for (path, mtime, size) in rows.flatten() {
+                    map.insert(path, (mtime, size));
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Parse stage (runs on worker threads — no DB writes). Reads/extracts/chunks a
+/// single file. Skips unchanged files (same path + mtime + size). Even files
+/// whose content can't be extracted are still chunked by path/name so they stay
+/// findable.
+fn prepare_one(
+    existing: &HashMap<String, (i64, i64)>,
     folder_id: i64,
     path: &Path,
-) -> Result<usize, String> {
-    let meta = path.metadata().map_err(|e| e.to_string())?;
+    root: &Path,
+) -> Outcome {
+    let path_str = path.to_string_lossy().to_string();
+    let meta = match path.metadata() {
+        Ok(m) => m,
+        Err(_) => return Outcome { path: path_str, job: None },
+    };
     let mtime = meta
         .modified()
         .ok()
@@ -164,47 +287,80 @@ fn index_one(
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     let size = meta.len() as i64;
-    let path_str = path.to_string_lossy().to_string();
 
     // Unchanged? (same path + mtime + size) → skip.
-    let existing: Option<(i64, i64, i64)> = conn
-        .query_row(
-            "SELECT id, mtime, size FROM files WHERE path = ?1",
-            params![path_str],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .ok();
-    if let Some((_, em, es)) = existing {
-        if em == mtime && es == size {
-            return Ok(0);
+    if let Some((em, es)) = existing.get(&path_str) {
+        if *em == mtime && *es == size {
+            return Outcome { path: path_str, job: None };
         }
     }
 
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    let hash = blake3::hash(&bytes).to_hex().to_string();
+    // Hash for change detection. Name-only kinds (images/video/legacy office)
+    // are never read for content — they can be gigabytes — so hash their
+    // identity instead of slurping the file into memory.
+    let hash = if parsers::is_name_only(path) {
+        blake3::hash(format!("{path_str}|{mtime}|{size}").as_bytes()).to_hex().to_string()
+    } else {
+        match std::fs::read(path) {
+            Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
+            Err(_) => return Outcome { path: path_str, job: None },
+        }
+    };
 
-    let text = match parsers::extract(path)? {
-        Some(t) => t,
-        None => return Ok(0),
+    // Body text (best effort). Even when extraction yields nothing or fails, we
+    // still index the path/name so the file is at least findable by name.
+    let body = match parsers::extract(path) {
+        Ok(Some(t)) => t,
+        Ok(None) => String::new(),
+        Err(e) => {
+            eprintln!("extract {path_str}: {e}");
+            String::new()
+        }
+    };
+    let context = path_context(path, root);
+    let text = if body.trim().is_empty() {
+        context
+    } else {
+        format!("{context}\n\n{body}")
     };
     let chunks = chunk::split(&text);
     if chunks.is_empty() {
-        return Ok(0);
+        return Outcome { path: path_str, job: None };
     }
 
+    Outcome {
+        path: path_str.clone(),
+        job: Some(WriteJob {
+            folder_id,
+            path: path_str,
+            mtime,
+            size,
+            hash,
+            chunks,
+        }),
+    }
+}
+
+/// Write stage (runs on the single writer). Persists a parsed file's chunks,
+/// FTS rows, and embeddings. Returns the number of chunks written.
+fn write_prepared(
+    conn: &Connection,
+    embedder: &Arc<Mutex<Option<Embedder>>>,
+    job: WriteJob,
+) -> Result<usize, String> {
     // Replace any prior version of this file.
-    delete_file_by_path(conn, &path_str)?;
+    delete_file_by_path(conn, &job.path)?;
 
     conn.execute(
         "INSERT INTO files(folder_id, path, mtime, hash, size, indexed_at)
          VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-        params![folder_id, path_str, mtime, hash, size, now_ms()],
+        params![job.folder_id, job.path, job.mtime, job.hash, job.size, now_ms()],
     )
     .map_err(|e| e.to_string())?;
     let file_id = conn.last_insert_rowid();
 
-    let mut chunk_ids = Vec::with_capacity(chunks.len());
-    for (ord, c) in chunks.iter().enumerate() {
+    let mut chunk_ids = Vec::with_capacity(job.chunks.len());
+    for (ord, c) in job.chunks.iter().enumerate() {
         conn.execute(
             "INSERT INTO chunks(file_id, ord, text, heading, char_start)
              VALUES(?1, ?2, ?3, ?4, ?5)",
@@ -224,7 +380,7 @@ fn index_one(
     {
         let guard = embedder.lock().unwrap();
         if let Some(e) = guard.as_ref() {
-            let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+            let texts: Vec<String> = job.chunks.iter().map(|c| c.text.clone()).collect();
             match e.embed_passages(&texts) {
                 Ok(vecs) => {
                     for (cid, v) in chunk_ids.iter().zip(vecs.iter()) {
@@ -240,7 +396,31 @@ fn index_one(
         }
     }
 
-    Ok(chunks.len())
+    Ok(job.chunks.len())
+}
+
+/// Index a single file end to end (parse + write). Convenience used by tests.
+#[cfg(test)]
+fn index_one(
+    conn: &Connection,
+    embedder: &Arc<Mutex<Option<Embedder>>>,
+    folder_id: i64,
+    path: &Path,
+    root: &Path,
+) -> Result<usize, String> {
+    let path_str = path.to_string_lossy().to_string();
+    let mut existing = HashMap::new();
+    if let Ok((mtime, size)) = conn.query_row(
+        "SELECT mtime, size FROM files WHERE path = ?1",
+        params![path_str],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+    ) {
+        existing.insert(path_str, (mtime, size));
+    }
+    match prepare_one(&existing, folder_id, path, root).job {
+        Some(job) => write_prepared(conn, embedder, job),
+        None => Ok(0),
+    }
 }
 
 fn delete_file_by_path(conn: &Connection, path: &str) -> Result<(), String> {
@@ -334,7 +514,7 @@ mod tests {
         {
             let p = entry.path();
             if p.is_file() && parsers::is_supported(p) {
-                total += index_one(&conn, &embedder, fid, p).unwrap();
+                total += index_one(&conn, &embedder, fid, p, &kb).unwrap();
             }
         }
         assert!(total > 0, "no chunks indexed");

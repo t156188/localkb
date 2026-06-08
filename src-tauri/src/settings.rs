@@ -64,3 +64,27 @@ fn active_provider(value: &Value) -> Option<&Value> {
 pub fn top_n(value: &Value) -> usize {
     value["topN"].as_u64().unwrap_or(8).clamp(1, 20) as usize
 }
+
+/// How many CPU cores to detect on this machine.
+pub fn cpu_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
+/// Recommended parsing concurrency for indexing: leave ~2 cores for the system
+/// and the OS UI so a big (re)index doesn't make the whole machine lag. Always
+/// at least 1.
+pub fn recommended_threads() -> usize {
+    cpu_cores().saturating_sub(2).max(1)
+}
+
+/// How many files to parse/extract in parallel during indexing. Reads the
+/// user's `indexThreads` setting; falls back to the per-machine recommendation
+/// when unset. Clamped to a sane range.
+pub fn index_threads(value: &Value) -> usize {
+    match value["indexThreads"].as_u64() {
+        Some(n) => (n as usize).clamp(1, 32),
+        None => recommended_threads(),
+    }
+}

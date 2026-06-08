@@ -1,6 +1,6 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 
 // ---- Types -----------------------------------------------------------------
@@ -74,6 +74,14 @@ export interface Settings {
   topN: number;
   /** Auto-reindex a folder when its files change on disk. */
   autoSync: boolean;
+  /** How many files to parse in parallel while indexing. Undefined = use the
+   *  per-machine recommendation the backend reports via `cpuInfo`. */
+  indexThreads?: number;
+}
+
+export interface CpuInfo {
+  cores: number;
+  recommended: number;
 }
 
 /**
@@ -120,6 +128,7 @@ export function normalizeSettings(raw: any): Settings {
     theme: raw?.theme ?? "system",
     topN: typeof raw?.topN === "number" ? raw.topN : 8,
     autoSync: typeof raw?.autoSync === "boolean" ? raw.autoSync : true,
+    indexThreads: typeof raw?.indexThreads === "number" ? raw.indexThreads : undefined,
   };
 }
 
@@ -170,6 +179,9 @@ export const setSettings = (value: Settings) =>
 export const listModels = (baseURL: string, apiKey: string) =>
   invoke<string[]>("list_models", { baseUrl: baseURL, apiKey });
 
+/** Detected CPU cores + the recommended indexing concurrency for this machine. */
+export const cpuInfo = () => invoke<CpuInfo>("cpu_info");
+
 // ---- History ---------------------------------------------------------------
 
 export const historyList = () => invoke<HistoryMeta[]>("history_list");
@@ -183,6 +195,18 @@ export const historyDelete = (id: string) => invoke("history_delete", { id });
 export async function pickFolder(): Promise<string | null> {
   const result = await openDialog({ directory: true, multiple: false });
   return typeof result === "string" ? result : null;
+}
+
+/** Native confirm before removing a folder from the KB. Makes clear only the
+ *  index is dropped — the user's files on disk are untouched. */
+export function confirmRemoveFolder(path: string): Promise<boolean> {
+  const name = path.split(/[/\\]/).filter(Boolean).pop() ?? path;
+  return confirmDialog(`确认移除【${name}】的文件索引，不会移除本地文件，请放心移除。`, {
+    title: "提示",
+    kind: "warning",
+    okLabel: "移除",
+    cancelLabel: "取消",
+  });
 }
 
 export const openFile = (path: string) => openPath(path);

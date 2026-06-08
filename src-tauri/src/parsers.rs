@@ -19,23 +19,45 @@ const IMAGE_EXTS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "tif", "tiff", "ico", "heic", "heif", "avif",
 ];
 
+/// Video extensions. Indexed by filename only (no content extraction).
+const VIDEO_EXTS: &[&str] = &[
+    "mp4", "mov", "avi", "mkv", "wmv", "flv", "webm", "m4v", "mpeg", "mpg", "3gp", "ts", "m2ts",
+    "rmvb", "rm", "vob", "ogv", "f4v",
+];
+
+/// The file's name (with extension), or "" if it has none.
+fn file_name(path: &Path) -> &str {
+    path.file_name().and_then(|n| n.to_str()).unwrap_or_default()
+}
+
 /// Returns true if this path's extension is something we can index.
 pub fn is_supported(path: &Path) -> bool {
-    matches!(
-        kind(path),
-        FileKind::Text | FileKind::Pdf | FileKind::Docx | FileKind::Pptx | FileKind::Xlsx | FileKind::Image
-    )
+    !matches!(kind(path), FileKind::Unsupported)
+}
+
+/// True for kinds indexed by filename only. These bypass the content size cap
+/// (videos can be huge) and skip reading the file's bytes entirely.
+pub fn is_name_only(path: &Path) -> bool {
+    matches!(kind(path), FileKind::Image | FileKind::Video | FileKind::DocLegacy)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FileKind {
     Text,
     Pdf,
+    /// .docx / .docm
     Docx,
+    /// .pptx / .pptm
     Pptx,
+    /// .xlsx / .xlsm / .xls / .xlsb / .ods (calamine auto-detects the format)
     Xlsx,
+    /// .odt / .odp — OpenDocument; text lives in the zip's content.xml
+    Odf,
     /// Indexed by filename only (no content extraction).
     Image,
+    Video,
+    /// Legacy binary Office (.doc / .ppt): no pure-Rust parser, so filename only.
+    DocLegacy,
     Unsupported,
 }
 
@@ -47,10 +69,13 @@ pub fn kind(path: &Path) -> FileKind {
         .unwrap_or_default();
     match ext.as_str() {
         "pdf" => FileKind::Pdf,
-        "docx" => FileKind::Docx,
-        "pptx" => FileKind::Pptx,
-        "xlsx" | "xlsm" => FileKind::Xlsx,
+        "docx" | "docm" => FileKind::Docx,
+        "pptx" | "pptm" => FileKind::Pptx,
+        "xlsx" | "xlsm" | "xls" | "xlsb" | "ods" => FileKind::Xlsx,
+        "odt" | "odp" => FileKind::Odf,
+        "doc" | "ppt" => FileKind::DocLegacy,
         _ if IMAGE_EXTS.contains(&ext.as_str()) => FileKind::Image,
+        _ if VIDEO_EXTS.contains(&ext.as_str()) => FileKind::Video,
         _ if TEXT_EXTS.contains(&ext.as_str()) => FileKind::Text,
         // Files named exactly like these (no extension) are still useful.
         _ => {
@@ -78,11 +103,12 @@ pub fn extract(path: &Path) -> Result<Option<String>, String> {
         FileKind::Docx => extract_ooxml(path, &["word/document.xml"])?,
         FileKind::Pptx => extract_pptx(path)?,
         FileKind::Xlsx => extract_xlsx(path)?,
+        // OpenDocument text/presentation: all body text lives in content.xml.
+        FileKind::Odf => extract_ooxml(path, &["content.xml"])?,
         // No content to read — index the filename so it's searchable by name.
-        FileKind::Image => {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-            format!("图片 {name}")
-        }
+        FileKind::Image => format!("图片 {}", file_name(path)),
+        FileKind::Video => format!("视频 {}", file_name(path)),
+        FileKind::DocLegacy => file_name(path).to_string(),
         FileKind::Unsupported => return Ok(None),
     };
     let trimmed = text.trim();
@@ -313,6 +339,30 @@ mod tests {
         // A PDF whose font lacks a ToUnicode map yields mostly '?'.
         assert!(mostly_unmappable("????????-OFF-029 ?????? ???????"));
         assert!(mostly_unmappable("\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}"));
+    }
+
+    #[test]
+    fn routes_office_and_media_extensions() {
+        use std::path::PathBuf;
+        let k = |s: &str| kind(&PathBuf::from(s));
+        // Office (content-extracted)
+        assert_eq!(k("a.docx"), FileKind::Docx);
+        assert_eq!(k("a.docm"), FileKind::Docx);
+        assert_eq!(k("a.pptm"), FileKind::Pptx);
+        assert_eq!(k("a.xls"), FileKind::Xlsx);
+        assert_eq!(k("a.xlsb"), FileKind::Xlsx);
+        assert_eq!(k("a.ods"), FileKind::Xlsx);
+        assert_eq!(k("a.odt"), FileKind::Odf);
+        assert_eq!(k("a.odp"), FileKind::Odf);
+        // Name-only
+        assert_eq!(k("a.doc"), FileKind::DocLegacy);
+        assert_eq!(k("a.ppt"), FileKind::DocLegacy);
+        assert_eq!(k("a.png"), FileKind::Image);
+        assert_eq!(k("a.mp4"), FileKind::Video);
+        assert!(is_name_only(&PathBuf::from("a.mov")));
+        assert!(!is_name_only(&PathBuf::from("a.pdf")));
+        // Still unsupported
+        assert_eq!(k("a.exe"), FileKind::Unsupported);
     }
 
     #[test]

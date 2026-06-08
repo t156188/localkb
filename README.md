@@ -6,7 +6,8 @@
 
 - **混合检索**：SQLite FTS5 关键词（中文 trigram 分词）+ 本地向量语义检索（fastembed / multilingual-e5-small），RRF 融合。
 - **引用来源**：回答下方列出引用的文件，点击用系统默认程序打开，或在文件夹中显示。
-- **多格式**：Markdown / 文本 / 代码、PDF、Word(.docx)、Excel(.xlsx)、PPT(.pptx)。
+- **多格式**：Markdown / 文本 / 代码、PDF、Word(.docx/.docm)、Excel(.xlsx/.xlsm/.xls/.xlsb/.ods)、PPT(.pptx/.pptm)、OpenDocument(.odt/.odp)。图片、视频、老版 .doc/.ppt 按**文件名**索引（可按名检索、点击打开）。
+- **名字也可检索**：每个文件的**文件名与所在文件夹路径**都进索引——即使正文抽取失败（扫描版 PDF、老格式等），也能按名字搜到。
 - **历史记录**：多会话，自动保存，可恢复 / 删除。
 - **可配置**：多个知识库文件夹；模型预设（OpenAI / DeepSeek / 智谱 GLM / 通义千问 / 本地 Ollama / 自定义）；浅色 / 深色主题。
 

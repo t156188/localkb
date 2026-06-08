@@ -411,6 +411,16 @@ pub fn list_models(base_url: String, api_key: String) -> Result<Vec<String>, Str
     crate::chat::list_models(&base_url, &api_key)
 }
 
+/// CPU info for the indexing-concurrency setting: total cores detected and the
+/// recommended default (leaves headroom so a big reindex doesn't lag the box).
+#[tauri::command]
+pub fn cpu_info() -> Value {
+    json!({
+        "cores": settings::cpu_cores(),
+        "recommended": settings::recommended_threads(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // History
 // ---------------------------------------------------------------------------
