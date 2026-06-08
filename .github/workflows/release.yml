@@ -54,17 +54,30 @@ jobs:
 
       # 把版本号同步成本次标签（v1.2.3 -> 1.2.3），写进 package.json / tauri.conf.json /
       # Cargo.toml / Cargo.lock。这样以后只要打新标签，产物版本号就自动跟上，无需手改源码。
+      # 用单引号 heredoc，bash 不解析内容，版本从环境变量 TAG 读，避免 $1 等转义坑。
       - name: Sync version to tag
         shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          set -euo pipefail
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          VER="${TAG#v}"
-          echo "Setting version to $VER (from tag $TAG)"
-          node -e "const fs=require('fs');const p='package.json';const c=JSON.parse(fs.readFileSync(p));c.version=process.argv[1];fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n')" "$VER"
-          node -e "const fs=require('fs');const p='src-tauri/tauri.conf.json';const c=JSON.parse(fs.readFileSync(p));c.version=process.argv[1];fs.writeFileSync(p,JSON.stringify(c,null,2)+'\n')" "$VER"
-          node -e "const fs=require('fs');const p='src-tauri/Cargo.toml';let s=fs.readFileSync(p,'utf8');s=s.replace(/^version = \"[^\"]*\"/m,'version = \"'+process.argv[1]+'\"');fs.writeFileSync(p,s)" "$VER"
-          node -e "const fs=require('fs');const p='src-tauri/Cargo.lock';let s=fs.readFileSync(p,'utf8');s=s.replace(/(name = \"localkb\"\nversion = )\"[^\"]*\"/,'$1\"'+process.argv[1]+'\"');fs.writeFileSync(p,s)" "$VER"
+          node <<'EOF'
+          const fs = require('fs');
+          const ver = process.env.TAG.replace(/^v/, '');
+          const setJson = (p, key) => {
+            const c = JSON.parse(fs.readFileSync(p));
+            c[key] = ver;
+            fs.writeFileSync(p, JSON.stringify(c, null, 2) + '\n');
+          };
+          setJson('package.json', 'version');
+          setJson('src-tauri/tauri.conf.json', 'version');
+          let toml = fs.readFileSync('src-tauri/Cargo.toml', 'utf8');
+          toml = toml.replace(/^version = "[^"]*"/m, `version = "${ver}"`);
+          fs.writeFileSync('src-tauri/Cargo.toml', toml);
+          let lock = fs.readFileSync('src-tauri/Cargo.lock', 'utf8');
+          lock = lock.replace(/(name = "localkb"\nversion = )"[^"]*"/, `$1"${ver}"`);
+          fs.writeFileSync('src-tauri/Cargo.lock', lock);
+          console.log('version set to', ver);
+          EOF
 
       - name: Install front-end deps
         run: npm ci
